@@ -376,7 +376,10 @@ class Storage(object):
 
                     else: # new entry
                         _children = []
-                        _rheads = [rev] if rev in head_revs else []
+			if rev in head_revs:
+                            _rheads = [rev]
+                        else:
+                            _rheads = []
 
                     # create/update entry -- transform lists into tuples since entry will be final
                     new_db[rev] = tuple(_children), tuple(parents), ord_rev + 1, tuple(_rheads)
