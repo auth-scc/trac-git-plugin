@@ -1,6 +1,6 @@
 # -*- coding: iso-8859-1 -*-
 #
-# Copyright (C) 2006,2008 Herbert Valerio Riedel <hvr@gnu.org>
+# Copyright (C) 2006-2010 Herbert Valerio Riedel <hvr@gnu.org>
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -14,13 +14,16 @@
 
 from __future__ import with_statement
 
+from future27 import namedtuple
+
 import os, re, sys, time, weakref
 from collections import deque
 from functools import partial
 from threading import Lock
 from subprocess import Popen, PIPE
+from operator import itemgetter
 import cStringIO
-import string
+import codecs
 
 __all__ = ["git_version", "GitError", "GitErrorSha", "Storage", "StorageFactory"]
 
@@ -30,10 +33,17 @@ class GitError(Exception):
 class GitErrorSha(GitError):
     pass
 
-class GitCore:
+class GitCore(object):
+    """
+    Low-level wrapper around git executable
+    """
+
     def __init__(self, git_dir=None, git_bin="git"):
         self.__git_bin = git_bin
         self.__git_dir = git_dir
+
+    def __repr__(self):
+        return '<GitCore bin="%s" dir="%s">' % (self.__git_bin, self.__git_dir)
 
     def __build_git_cmd(self, gitcmd, *args):
         "construct command tuple for git call suitable for Popen()"
@@ -69,16 +79,23 @@ class GitCore:
     __is_sha_pat = re.compile(r'[0-9A-Fa-f]*$')
 
     @classmethod
-    def is_sha(cls,sha):
-        """returns whether sha is a potential sha id
-        (i.e. proper hexstring between 4 and 40 characters"""
+    def is_sha(cls, sha):
+        """
+        returns whether sha is a potential sha id
+        (i.e. proper hexstring between 4 and 40 characters)
+        """
+
+        # quick test before starting up regexp matcher
         if not (4 <= len(sha) <= 40):
             return False
 
         return bool(cls.__is_sha_pat.match(sha))
 
-# helper class for caching...
 class SizedDict(dict):
+    """
+    Size-bounded dictionary with FIFO replacement strategy
+    """
+
     def __init__(self, max_size=0):
         dict.__init__(self)
         self.__max_size = max_size
@@ -101,23 +118,22 @@ class SizedDict(dict):
 
             return rc
 
-    def setdefault(k,d=None):
-        # TODO
-        raise AttributeError("SizedDict has no setdefault() method")
+    def setdefault(self, *_):
+        raise NotImplemented("SizedDict has no setdefault() method")
 
-class StorageFactory:
+class StorageFactory(object):
     __dict = weakref.WeakValueDictionary()
     __dict_nonweak = dict()
     __dict_lock = Lock()
 
-    def __init__(self, repo, log, weak=True, git_bin='git'):
+    def __init__(self, repo, log, weak=True, git_bin='git', git_fs_encoding=None):
         self.logger = log
 
         with StorageFactory.__dict_lock:
             try:
                 i = StorageFactory.__dict[repo]
             except KeyError:
-                i = Storage(repo, log, git_bin)
+                i = Storage(repo, log, git_bin, git_fs_encoding)
                 StorageFactory.__dict[repo] = i
 
                 # create or remove additional reference depending on 'weak' argument
@@ -138,8 +154,15 @@ class StorageFactory:
                           % (("","weak ")[is_weak], id(self.__inst), self.__repo))
         return self.__inst
 
-class Storage:
+
+class Storage(object):
+    """
+    High-level wrapper around GitCore with in-memory caching
+    """
+
     __SREV_MIN = 4 # minimum short-rev length
+
+    RevCache = namedtuple('RevCache', 'youngest_rev oldest_rev rev_dict tag_set srev_dict branch_dict')
 
     @staticmethod
     def __rev_key(rev):
@@ -151,11 +174,11 @@ class Storage:
 
     @staticmethod
     def git_version(git_bin="git"):
-        GIT_VERSION_MIN_REQUIRED = (1,5,6)
+        GIT_VERSION_MIN_REQUIRED = (1, 5, 6)
         try:
             g = GitCore(git_bin=git_bin)
             [v] = g.version().splitlines()
-            _,_,version = v.strip().split()
+            _, _, version = v.strip().split()
             # 'version' has usually at least 3 numeric version components, e.g.::
             #  1.5.4.2
             #  1.5.4.3.230.g2db511
@@ -176,11 +199,43 @@ class Storage:
             result['v_min_str'] = ".".join(map(str, GIT_VERSION_MIN_REQUIRED))
             result['v_compatible'] = split_version >= GIT_VERSION_MIN_REQUIRED
             return result
-        except:
-            raise GitError("Could not retrieve GIT version")
 
-    def __init__(self, git_dir, log, git_bin='git'):
+        except Exception, e:
+            raise GitError("Could not retrieve GIT version"
+                           " (tried to execute/parse '%s --version' but got %s)"
+                           % (git_bin, repr(e)))
+
+    def __init__(self, git_dir, log, git_bin='git', git_fs_encoding=None):
+        """
+        Initialize PyGit.Storage instance
+
+        `git_dir`: path to .git folder;
+                this setting is not affected by the `git_fs_encoding` setting
+
+        `log`: logger instance
+
+        `git_bin`: path to executable
+                this setting is not affected by the `git_fs_encoding` setting
+
+        `git_fs_encoding`: encoding used for paths stored in git repository;
+                if `None`, no implicit decoding/encoding to/from
+                unicode objects is performed, and bytestrings are
+                returned instead
+
+        """
+
         self.logger = log
+
+        if git_fs_encoding is not None:
+            # validate encoding name
+            codecs.lookup(git_fs_encoding)
+
+            # setup conversion functions
+            self._fs_to_unicode = lambda s: s.decode(git_fs_encoding)
+            self._fs_from_unicode = lambda s: s.encode(git_fs_encoding)
+        else:
+            # pass bytestrings as-is w/o any conversion
+            self._fs_to_unicode = self._fs_from_unicode = lambda s: s
 
         # simple sanity checking
         __git_file_path = partial(os.path.join, git_dir)
@@ -207,8 +262,6 @@ class Storage:
         self.__commit_msg_cache = SizedDict(200)
         self.__commit_msg_lock = Lock()
 
-
-
     def __del__(self):
         self.logger.debug("PyGIT.Storage instance %d destructed" % id(self))
 
@@ -219,10 +272,11 @@ class Storage:
     # called by Storage.sync()
     def __rev_cache_sync(self, youngest_rev=None):
         "invalidates revision db cache if necessary"
+
         with self.__rev_cache_lock:
             need_update = False
             if self.__rev_cache:
-                last_youngest_rev = self.__rev_cache[0]
+                last_youngest_rev = self.__rev_cache.youngest_rev
                 if last_youngest_rev != youngest_rev:
                     self.logger.debug("invalidated caches (%s != %s)" % (last_youngest_rev, youngest_rev))
                     need_update = True
@@ -235,16 +289,23 @@ class Storage:
             return need_update
 
     def get_rev_cache(self):
+        """
+        Retrieve revision cache
+
+        may rebuild cache on the fly if required
+
+        returns RevCache tuple
+        """
+
         with self.__rev_cache_lock:
             if self.__rev_cache is None: # can be cleared by Storage.__rev_cache_sync()
                 self.logger.debug("triggered rebuild of commit tree db for %d" % id(self))
-                new_db = {}
-                new_sdb = {}
-                new_tags = set([])
+                ts0 = time.time()
+
                 youngest = None
                 oldest = None
-                for revs in self.repo.rev_parse("--tags").splitlines():
-                    new_tags.add(revs.strip())
+                new_db = {} # db
+                new_sdb = {} # short_rev db
 
                 # helper for reusing strings
                 __rev_seen = {}
@@ -252,71 +313,73 @@ class Storage:
                     rev = str(rev)
                     return __rev_seen.setdefault(rev, rev)
 
-                rev = ord_rev = 0
-                for revs in self.repo.rev_list("--parents", "--all").splitlines():
-                    revs = revs.strip().split()
+                new_tags = set(__rev_reuse(rev.strip()) for rev in self.repo.rev_parse("--tags").splitlines())
 
-                    revs = map(__rev_reuse, revs)
+                new_branches = [(k, __rev_reuse(v)) for k, v in self._get_branches()]
+                head_revs = set(v for _, v in new_branches)
+
+                rev = ord_rev = 0
+                for ord_rev, revs in enumerate(self.repo.rev_list("--parents",
+                                                                  "--topo-order",
+                                                                  "--all").splitlines()):
+                    revs = map(__rev_reuse, revs.strip().split())
 
                     rev = revs[0]
+
+                    # first rev seen is assumed to be the youngest one
+                    if not ord_rev:
+                        youngest = rev
 
                     # shortrev "hash" map
                     srev_key = self.__rev_key(rev)
                     new_sdb.setdefault(srev_key, []).append(rev)
 
+                    # parents
                     parents = tuple(revs[1:])
 
-                    ord_rev += 1
-
-                    # first rev seen is assumed to be the youngest one (and has ord_rev=1)
-                    if not youngest:
-                        youngest = rev
-
-                    # new_db[rev] = (children(rev), parents(rev), ordinal_id(rev))
-                    if new_db.has_key(rev):
-                        _children,_parents,_ord_rev = new_db[rev]
+                    # new_db[rev] = (children(rev), parents(rev), ordinal_id(rev), rheads(rev))
+                    if rev in new_db:
+                        # (incomplete) entry was already created by children
+                        _children, _parents, _ord_rev, _rheads = new_db[rev]
                         assert _children
                         assert not _parents
                         assert _ord_rev == 0
-                    else:
+
+                        if rev in head_revs and rev not in _rheads:
+                            _rheads.append(rev)
+
+                    else: # new entry
                         _children = []
+                        _rheads = [rev] if rev in head_revs else []
 
-                    # create/update entry
-                    new_db[rev] = _children, parents, ord_rev
+                    # create/update entry -- transform lists into tuples since entry will be final
+                    new_db[rev] = tuple(_children), tuple(parents), ord_rev + 1, tuple(_rheads)
 
-                    # update all parents(rev)'s children
+                    # update parents(rev)s
                     for parent in parents:
                         # by default, a dummy ordinal_id is used for the mean-time
-                        _children, _parents, _ord_rev = new_db.setdefault(parent, ([], [], 0))
+                        _children, _parents, _ord_rev, _rheads2 = new_db.setdefault(parent, ([], [], 0, []))
+
+                        # update parent(rev)'s children
                         if rev not in _children:
                             _children.append(rev)
+
+                        # update parent(rev)'s rheads
+                        for rev in _rheads:
+                            if rev not in _rheads2:
+                                _rheads2.append(rev)
 
                 # last rev seen is assumed to be the oldest one (with highest ord_rev)
                 oldest = rev
 
                 __rev_seen = None
 
-                assert len(new_db) == ord_rev
-
-                # convert children lists to tuples
-                tmp = {}
-                try:
-                    while True:
-                        k,v = new_db.popitem()
-                        assert v[2] > 0
-                        tmp[k] = tuple(v[0]),v[1],v[2]
-                except KeyError:
-                    pass
-
-                assert len(new_db) == 0
-                new_db = tmp
-
                 # convert sdb either to dict or array depending on size
                 tmp = [()]*(max(new_sdb.keys())+1) if len(new_sdb) > 5000 else {}
 
                 try:
                     while True:
-                        k,v = new_sdb.popitem()
+                        k, v = new_sdb.popitem()
                         tmp[k] = tuple(v)
                 except KeyError:
                     pass
@@ -325,31 +388,71 @@ class Storage:
                 new_sdb = tmp
 
                 # atomically update self.__rev_cache
-                self.__rev_cache = youngest, oldest, new_db, new_tags, new_sdb
-                self.logger.debug("rebuilt commit tree db for %d with %d entries" % (id(self),len(new_db)))
+                self.__rev_cache = Storage.RevCache(youngest, oldest, new_db, new_tags, new_sdb, new_branches)
+                ts1 = time.time()
+                self.logger.debug("rebuilt commit tree db for %d with %d entries (took %.1f ms)"
+                                  % (id(self), len(new_db), 1000*(ts1-ts0)))
 
             assert all(e is not None for e in self.__rev_cache) or not any(self.__rev_cache)
 
             return self.__rev_cache
         # with self.__rev_cache_lock
 
-    # tuple: youngest_rev, oldest_rev, rev_dict, tag_dict, short_rev_dict
+    # see RevCache namedtuple
     rev_cache = property(get_rev_cache)
 
+    def _get_branches(self):
+        "returns list of (local) branches, with active (= HEAD) one being the first item"
+
+        result = []
+        for e in self.repo.branch("-v", "--no-abbrev").splitlines():
+            bname, bsha = e[1:].strip().split()[:2]
+            if e.startswith('*'):
+                result.insert(0, (bname, bsha))
+            else:
+                result.append((bname, bsha))
+
+        return result
+
+    def get_branches(self):
+        "returns list of (local) branches, with active (= HEAD) one being the first item"
+        return self.rev_cache.branch_dict
+
     def get_commits(self):
-        return self.rev_cache[2]
+        return self.rev_cache.rev_dict
 
     def oldest_rev(self):
-        return self.rev_cache[1]
+        return self.rev_cache.oldest_rev
 
     def youngest_rev(self):
-        return self.rev_cache[0]
+        return self.rev_cache.youngest_rev
+
+    def get_branch_contains(self, sha, resolve=False):
+        """
+        return list of reachable head sha ids or (names, sha) pairs if resolve is true
+
+        see also get_branches()
+        """
+
+        _rev_cache = self.rev_cache
+
+        self.logger.debug('find %s is: %d' % (sha, (int)(sha in _rev_cache.rev_dict)))
+        try:
+            rheads = _rev_cache.rev_dict[sha][3]
+        except KeyError:
+            self.logger.debug('cannot find %s' % sha)
+            return []
+
+        if resolve:
+            return [ (k, v) for k, v in _rev_cache.branch_dict if v in rheads ]
+
+        return rheads
 
     def history_relative_rev(self, sha, rel_pos):
         db = self.get_commits()
 
         if sha not in db:
-            raise GitErrorSha
+            raise GitErrorSha()
 
         if rel_pos == 0:
             return sha
@@ -359,7 +462,7 @@ class Storage:
         if lin_rev < 1 or lin_rev > len(db):
             return None
 
-        for k,v in db.iteritems():
+        for k, v in db.iteritems():
             if v[2] == lin_rev:
                 return k
 
@@ -387,7 +490,7 @@ class Storage:
         "verify/lookup given revision object and return a sha id or None if lookup failed"
         rev = str(rev)
 
-        db, tag_db = self.rev_cache[2:4]
+        _rev_cache = self.rev_cache
 
         if GitCore.is_sha(rev):
             # maybe it's a short or full rev
@@ -400,11 +503,11 @@ class Storage:
         if not rc:
             return None
 
-        if db.has_key(rc):
+        if rc in _rev_cache.rev_dict:
             return rc
 
-        if rc in tag_db:
-            sha=self.repo.cat_file("tag", rc).split(None, 2)[:2]
+        if rc in _rev_cache.tag_set:
+            sha = self.repo.cat_file("tag", rc).split(None, 2)[:2]
             if sha[0] != 'object':
                 self.logger.debug("unexpected result from 'git-cat-file tag %s'" % rc)
                 return None
@@ -421,13 +524,13 @@ class Storage:
         if min_len < self.__SREV_MIN:
             min_len = self.__SREV_MIN
 
-        db, tag_db, sdb = self.rev_cache[2:5]
+        _rev_cache = self.rev_cache
 
-        if rev not in db:
+        if rev not in _rev_cache.rev_dict:
             return None
 
         srev = rev[:min_len]
-        srevs = set(sdb[self.__rev_key(rev)])
+        srevs = set(_rev_cache.srev_dict[self.__rev_key(rev)])
 
         if len(srevs) == 1:
             return srev # we already got a unique id
@@ -446,17 +549,18 @@ class Storage:
     def fullrev(self, srev):
         "try to reverse shortrev()"
         srev = str(srev)
-        db, tag_db, sdb = self.rev_cache[2:5]
+
+        _rev_cache = self.rev_cache
 
         # short-cut
-        if len(srev) == 40 and srev in db:
+        if len(srev) == 40 and srev in _rev_cache.rev_dict:
             return srev
 
         if not GitCore.is_sha(srev):
             return None
 
         try:
-            srevs = sdb[self.__rev_key(srev)]
+            srevs = _rev_cache.srev_dict[self.__rev_key(srev)]
         except KeyError:
             return None
 
@@ -466,22 +570,14 @@ class Storage:
 
         return None
 
-    def get_branches(self):
-        "returns list of (local) branches, with active (= HEAD) one being the first item"
-        result=[]
-        for e in self.repo.branch("-v", "--no-abbrev").splitlines():
-            (bname,bsha)=e[1:].strip().split()[:2]
-            if e.startswith('*'):
-                result.insert(0,(bname,bsha))
-            else:
-                result.append((bname,bsha))
-        return result
-
     def get_tags(self):
-        return [e.strip() for e in self.repo.tag("-l").splitlines()]
+        return [ e.strip() for e in self.repo.tag("-l").splitlines() ]
 
     def ls_tree(self, rev, path=""):
         rev = rev and str(rev) or 'HEAD' # paranoia
+
+        path = self._fs_from_unicode(path)
+
         if path.startswith('/'):
             path = path[1:]
 
@@ -489,15 +585,16 @@ class Storage:
 
         def split_ls_tree_line(l):
             "split according to '<mode> <type> <sha> <size>\t<fname>'"
-            meta,fname = l.split('\t')
-            _mode,_type,_sha,_size = meta.split()
+
+            meta, fname = l.split('\t', 1)
+            _mode, _type, _sha, _size = meta.split()
 
             if _size == '-':
                 _size = None
             else:
                 _size = int(_size)
 
-            return _mode,_type,_sha,_size,fname
+            return _mode, _type, _sha, _size, self._fs_to_unicode(fname)
 
         return [ split_ls_tree_line(e) for e in tree if e ]
 
@@ -505,11 +602,12 @@ class Storage:
         if not commit_id:
             raise GitError("read_commit called with empty commit_id")
 
-        commit_id = str(commit_id)
+        commit_id, commit_id_orig = self.fullrev(commit_id), commit_id
 
         db = self.get_commits()
         if commit_id not in db:
-            self.logger.info("read_commit failed for '%s'" % commit_id)
+            self.logger.info("read_commit failed for '%s' ('%s')" %
+                             (commit_id, commit_id_orig))
             raise GitErrorSha
 
         with self.__commit_msg_lock:
@@ -529,8 +627,8 @@ class Storage:
             line = lines.pop(0)
             props = {}
             while line:
-                (key,value) = line.split(None, 1)
-                props.setdefault(key,[]).append(value.strip())
+                key, value = line.split(None, 1)
+                props.setdefault(key, []).append(value.strip())
                 line = lines.pop(0)
 
             result = ("\n".join(lines), props)
@@ -560,20 +658,25 @@ class Storage:
         except KeyError:
             return []
 
-    def children_recursive(self, sha):
-        db = self.get_commits()
+    def children_recursive(self, sha, rev_dict=None):
+        """
+        Recursively traverse children in breadth-first order
+        """
+
+        if rev_dict is None:
+            rev_dict = self.get_commits()
 
         work_list = deque()
         seen = set()
 
-        seen.update(db[sha][0])
-        work_list.extend(db[sha][0])
+        seen.update(rev_dict[sha][0])
+        work_list.extend(rev_dict[sha][0])
 
         while work_list:
             p = work_list.popleft()
             yield p
 
-            _children = set(db[p][0]) - seen
+            _children = set(rev_dict[p][0]) - seen
 
             seen.update(_children)
             work_list.extend(_children)
@@ -592,18 +695,21 @@ class Storage:
         return self.get_commits().iterkeys()
 
     def sync(self):
-        rev = self.repo.rev_list("--max-count=1", "--all").strip()
+        rev = self.repo.rev_list("--max-count=1", "--topo-order", "--all").strip()
         return self.__rev_cache_sync(rev)
 
     def last_change(self, sha, path):
         return self.repo.rev_list("--max-count=1",
-                                  sha, "--", path).strip() or None
+                                  sha, "--",
+                                  self._fs_from_unicode(path)).strip() or None
 
     def history(self, sha, path, limit=None):
         if limit is None:
             limit = -1
 
-        tmp = self.repo.rev_list("--max-count=%d" % limit, str(sha), "--", path)
+        tmp = self.repo.rev_list("--max-count=%d" % limit, str(sha), "--",
+                                 self._fs_from_unicode(path))
+
         return [ rev.strip() for rev in tmp.splitlines() ]
 
     def history_timerange(self, start, stop):
@@ -615,12 +721,19 @@ class Storage:
 
     def rev_is_anchestor_of(self, rev1, rev2):
         """return True if rev2 is successor of rev1"""
+
         rev1 = rev1.strip()
         rev2 = rev2.strip()
-        return rev2 in self.children_recursive(rev1)
+
+        rev_dict = self.get_commits()
+
+        return (rev2 in rev_dict and
+                rev2 in self.children_recursive(rev1, rev_dict))
 
     def blame(self, commit_sha, path):
         in_metadata = False
+
+        path = self._fs_from_unicode(path)
 
         for line in self.repo.blame("-p", "--", path, str(commit_sha)).splitlines():
             assert line
@@ -646,7 +759,7 @@ class Storage:
         # diff-tree returns records with the following structure:
         # :<old-mode> <new-mode> <old-sha> <new-sha> <change> NUL <old-path> NUL [ <new-path> NUL ]
 
-        path = path.strip("/")
+        path = self._fs_from_unicode(path).strip("/")
         diff_tree_args = ["-z", "-r"]
         if find_renames:
             diff_tree_args.append("-M")
@@ -665,11 +778,17 @@ class Storage:
             assert not lines[0].startswith(':')
             del lines[0]
 
+        # FIXME: the following code is ugly, needs rewrite
+
         chg = None
 
         def __chg_tuple():
             if len(chg) == 6:
                 chg.append(None)
+            else:
+                chg[6] = self._fs_to_unicode(chg[6])
+            chg[5] = self._fs_to_unicode(chg[5])
+
             assert len(chg) == 7
             return tuple(chg)
 
@@ -683,6 +802,7 @@ class Storage:
             else:
                 chg.append(line)
 
+        # handle left-over chg entry
         if chg:
             yield __chg_tuple()
 
@@ -690,8 +810,8 @@ class Storage:
 ############################################################################
 ############################################################################
 
-if __name__ == '__main__':
-    import sys, logging, timeit
+def main():
+    import logging, timeit
 
     assert not GitCore.is_sha("123")
     assert GitCore.is_sha("1a3f")
@@ -723,13 +843,12 @@ if __name__ == '__main__':
 
     print "statm =", proc_statm()
     __data_size = proc_statm()[5]
-    __data_size_last = __data_size
+    __data_size_last = [__data_size]
 
     def print_data_usage():
-        global __data_size_last
         __tmp = proc_statm()[5]
-        print "DATA: %6d %+6d" % (__tmp - __data_size, __tmp - __data_size_last)
-        __data_size_last = __tmp
+        print "DATA: %6d %+6d" % (__tmp - __data_size, __tmp - __data_size_last[0])
+        __data_size_last[0] = __tmp
 
     print_data_usage()
 
@@ -762,17 +881,17 @@ if __name__ == '__main__':
     print "--------------"
 
     p = g.head()
-    for i in range(-5,5):
+    for i in range(-5, 5):
         print i, g.history_relative_rev(p, i)
 
     # check for loops
     def check4loops(head):
         print "check4loops", head
         seen = set([head])
-        for sha in g.children_recursive(head):
-            if sha in seen:
-                print "dupe detected :-/", sha, len(seen)
-            seen.add(sha)
+        for _sha in g.children_recursive(head):
+            if _sha in seen:
+                print "dupe detected :-/", _sha, len(seen)
+            seen.add(_sha)
         return seen
 
     print len(check4loops(g.parents(g.head())[0]))
@@ -790,10 +909,10 @@ if __name__ == '__main__':
             assert i.startswith(s)
             assert g.fullrev(s) == i
 
-    iters = 1
-    print "timing %d*shortrev_test()..." % len(revs)
-    t = timeit.Timer("shortrev_test()", "from __main__ import shortrev_test")
-    print "%.2f usec/rev" % (1000000 * t.timeit(number=iters)/len(revs))
+    # iters = 1
+    # print "timing %d*shortrev_test()..." % len(revs)
+    # t = timeit.Timer("shortrev_test()", "from __main__ import shortrev_test")
+    # print "%.2f usec/rev" % (1000000 * t.timeit(number=iters)/len(revs))
 
     #print len(check4loops(g.oldest_rev()))
     #print len(list(g.children_recursive(g.oldest_rev())))
@@ -805,19 +924,23 @@ if __name__ == '__main__':
     if 1:
         print "--------------"
         rev = g.head()
-        for mode,type,sha,_size,name in g.ls_tree(rev):
+        for mode, _type, sha, _size, name in g.ls_tree(rev):
             [last_rev] = g.history(rev, name, limit=1)
-            s = g.get_obj_size(sha) if type == "blob" else 0
+            s = g.get_obj_size(sha) if _type == "blob" else 0
             msg = g.read_commit(last_rev)
 
-            print "%s %s %10d [%s]" % (type, last_rev, s, name)
+            print "%s %s %10d [%s]" % (_type, last_rev, s, name)
 
     print "allocating 2nd instance"
     print_data_usage()
     g2 = Storage(sys.argv[1], logging)
     g2.head()
     print_data_usage()
+
     print "allocating 3rd instance"
     g3 = Storage(sys.argv[1], logging)
     g3.head()
     print_data_usage()
+
+if __name__ == '__main__':
+    main()
