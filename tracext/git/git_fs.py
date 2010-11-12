@@ -57,7 +57,7 @@ class GitCachedRepository(CachedRepository):
         return normrev
 
     def get_changeset(self, rev):
-        return GitCachedChangeset(self, self.normalize_rev(rev), self.env)
+        return GitCachedChangeset(self.repos, self.normalize_rev(rev), self.getdb, self.authz)
 
 
 class GitCachedChangeset(CachedChangeset):
@@ -245,7 +245,7 @@ class GitConnector(Component):
                               )
 
         if self._cached_repository:
-            repos = GitCachedRepository(self.env, repos, self.log)
+            repos = GitCachedRepository(self.env.get_db_cnx(), repos, None, self.log)
             self.log.debug("enabled CachedRepository for '%s'" % dir)
         else:
             self.log.debug("disabled CachedRepository for '%s'" % dir)
