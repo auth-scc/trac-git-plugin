@@ -31,8 +31,8 @@ from datetime import datetime
 import sys
 import os
 
-if not sys.version_info[:2] >= (2, 5):
-    raise TracError("Python >= 2.5 dependancy not met")
+if not sys.version_info[:2] >= (2, 4):
+    raise TracError("Python >= 2.4 dependancy not met")
 
 import PyGIT
 
@@ -566,7 +566,10 @@ class GitNode(Node):
     def get_history(self, limit=None):
         # TODO: find a way to follow renames/copies
         for is_last, rev in _last_iterable(self.repos.git.history(self.rev, self.__git_path(), limit)):
-            yield (self.path, rev, Changeset.EDIT if not is_last else Changeset.ADD)
+            if not is_last:
+                yield (self.path, rev, Changeset.EDIT)
+            else:
+                yield (self.path, rev, Changeset.ADD)
 
     def get_last_modified(self):
         if not self.isfile:

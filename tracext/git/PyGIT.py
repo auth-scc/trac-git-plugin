@@ -12,13 +12,10 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 
-from __future__ import with_statement
-
 from future27 import namedtuple
 
 import os, re, sys, time, weakref
 from collections import deque
-from functools import partial
 from threading import Lock
 from subprocess import Popen, PIPE
 from operator import itemgetter
@@ -26,6 +23,24 @@ import cStringIO
 import codecs
 
 __all__ = ["git_version", "GitError", "GitErrorSha", "Storage", "StorageFactory"]
+
+try:
+    all
+except NameError:
+    def all(iterable):
+        for i in iterable:
+            if not i:
+                return False
+        return True
+
+try:
+    any
+except NameError:
+    def any(iterable):
+        for i in iterable:
+            if i:
+                return True
+        return False
 
 class GitError(Exception):
     pass
@@ -74,7 +89,7 @@ class GitCore(object):
         return stdout_data
 
     def __getattr__(self, name):
-        return partial(self.__execute, name.replace('_','-'))
+        return lambda *args: self.__execute(name.replace('_','-'), *args)
 
     __is_sha_pat = re.compile(r'[0-9A-Fa-f]*$')
 
@@ -103,7 +118,9 @@ class SizedDict(dict):
         self.__lock = Lock()
 
     def __setitem__(self, name, value):
-        with self.__lock:
+        self.__lock.acquire()
+        try:
+
             assert len(self) == len(self.__key_fifo) # invariant
 
             if not self.__contains__(name):
@@ -117,6 +134,8 @@ class SizedDict(dict):
             assert len(self) == len(self.__key_fifo) # invariant
 
             return rc
+        finally:
+            self.__lock.release()
 
     def setdefault(self, *_):
         raise NotImplemented("SizedDict has no setdefault() method")
@@ -129,7 +148,9 @@ class StorageFactory(object):
     def __init__(self, repo, log, weak=True, git_bin='git', git_fs_encoding=None):
         self.logger = log
 
-        with StorageFactory.__dict_lock:
+        StorageFactory.__dict_lock.acquire()
+        try:
+
             try:
                 i = StorageFactory.__dict[repo]
             except KeyError:
@@ -144,6 +165,8 @@ class StorageFactory(object):
                         pass
                 else:
                     StorageFactory.__dict_nonweak[repo] = i
+        finally:
+            StorageFactory.__dict_lock.release()
 
         self.__inst = i
         self.__repo = repo
@@ -238,7 +261,7 @@ class Storage(object):
             self._fs_to_unicode = self._fs_from_unicode = lambda s: s
 
         # simple sanity checking
-        __git_file_path = partial(os.path.join, git_dir)
+        __git_file_path = lambda *args: os.path.join(git_dir, *args)
         if not all(map(os.path.exists,
                        map(__git_file_path,
                            ['HEAD','objects','refs']))):
@@ -270,7 +293,8 @@ class Storage(object):
     def __rev_cache_sync(self, youngest_rev=None):
         "invalidates revision db cache if necessary"
 
-        with self.__rev_cache_lock:
+        self.__rev_cache_lock.acquire()
+	try:
             need_update = False
             if self.__rev_cache:
                 last_youngest_rev = self.__rev_cache.youngest_rev
@@ -284,6 +308,9 @@ class Storage(object):
                 self.__rev_cache = None
 
             return need_update
+        finally:
+            self.__rev_cache_lock.release()
+
 
     def get_rev_cache(self):
         """
@@ -294,7 +321,8 @@ class Storage(object):
         returns RevCache tuple
         """
 
-        with self.__rev_cache_lock:
+        self.__rev_cache_lock.acquire()
+        try:
             if self.__rev_cache is None: # can be cleared by Storage.__rev_cache_sync()
                 self.logger.debug("triggered rebuild of commit tree db for %d" % id(self))
                 ts0 = time.time()
@@ -347,7 +375,10 @@ class Storage(object):
 
                     else: # new entry
                         _children = []
-                        _rheads = [rev] if rev in head_revs else []
+                        if rev in head_revs:
+                            _rheads = [rev]
+                        else:
+                            _rheads = []
 
                     # create/update entry -- transform lists into tuples since entry will be final
                     new_db[rev] = tuple(_children), tuple(parents), ord_rev + 1, tuple(_rheads)
@@ -372,7 +403,10 @@ class Storage(object):
                 __rev_seen = None
 
                 # convert sdb either to dict or array depending on size
-                tmp = [()]*(max(new_sdb.keys())+1) if len(new_sdb) > 5000 else {}
+                if len(new_sdb) > 5000:
+                    tmp = [()]*(max(new_sdb.keys())+1)
+                else:
+                    tmp = {}
 
                 try:
                     while True:
@@ -393,7 +427,9 @@ class Storage(object):
             assert all(e is not None for e in self.__rev_cache) or not any(self.__rev_cache)
 
             return self.__rev_cache
-        # with self.__rev_cache_lock
+
+        finally:
+            self.__rev_cache_lock.release()
 
     # see RevCache namedtuple
     rev_cache = property(get_rev_cache)
@@ -605,7 +641,8 @@ class Storage(object):
                              (commit_id, commit_id_orig))
             raise GitErrorSha
 
-        with self.__commit_msg_lock:
+        self.__commit_msg_lock.acquire()
+        try:
             if self.__commit_msg_cache.has_key(commit_id):
                 # cache hit
                 result = self.__commit_msg_cache[commit_id]
@@ -631,6 +668,9 @@ class Storage(object):
             self.__commit_msg_cache[commit_id] = result
 
             return result[0], dict(result[1])
+
+        finally:
+            self.__commit_msg_lock.release()
 
     def get_file(self, sha):
         return cStringIO.StringIO(self.repo.cat_file("blob", str(sha)))
@@ -758,8 +798,11 @@ class Storage(object):
         diff_tree_args = ["-z", "-r"]
         if find_renames:
             diff_tree_args.append("-M")
-        diff_tree_args.extend([str(tree1) if tree1 else "--root",
-                               str(tree2),
+        if tree1:
+            diff_tree_args.append(str(tree1))
+        else:
+            diff_tree_args.append("--root")
+        diff_tree_args.extend([str(tree2),
                                "--", path])
 
         lines = self.repo.diff_tree(*diff_tree_args).split('\0')
@@ -921,7 +964,11 @@ def main():
         rev = g.head()
         for mode, _type, sha, _size, name in g.ls_tree(rev):
             [last_rev] = g.history(rev, name, limit=1)
-            s = g.get_obj_size(sha) if _type == "blob" else 0
+            if _type == "blob":
+                s = g.get_obj_size(sha)
+            else:
+                s = 0
+
             msg = g.read_commit(last_rev)
 
             print "%s %s %10d [%s]" % (_type, last_rev, s, name)

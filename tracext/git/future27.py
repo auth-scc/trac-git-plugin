@@ -12,6 +12,15 @@ import sys as _sys
 # collections.namedtuple
 
 try:
+    all
+except NameError:
+    def all(iterable):
+        for i in iterable:
+            if not i:
+                return False
+        return True
+
+try:
   # try to use the standard library's namedtuple...
   from collections import namedtuple
 
